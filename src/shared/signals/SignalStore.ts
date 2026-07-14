@@ -9,12 +9,11 @@ import {
 	SIGNALS_MAX_LINES,
 	foldSignals,
 	isSignalEvent,
-	mergeSignals,
 	parseSignalLog,
 	pruneSignals,
 	serializeEvent,
 } from "./signalsAggregate.mjs";
-import type { FoldOptions, SignalEvent, SignalsIndex } from "./signalsAggregate.mjs";
+import type { FoldOptions, SignalEvent, SignalKind, SignalsIndex } from "./signalsAggregate.mjs";
 
 /**
  * The plugin-side Signals store (DESIGN 5). An append-only NDJSON log plus a compacted
@@ -51,7 +50,12 @@ export const SIGNALS_ROOT = "second-read";
 export const SIGNALS_DIR = "second-read/signals";
 /** Events buffer in memory and hit the disk at most this often. Never one append per keystroke. */
 export const SIGNALS_FLUSH_MS = 10_000;
-export const SNAPSHOT_VERSION = 1;
+/**
+ * 2 — a snapshot now holds the fold of EVERY shard, plus a per-shard watermark, instead of
+ * only its own shard's events. A v1 snapshot is discarded on read (the logs are still
+ * authoritative). See `compact()` for why the old shape produced permanent ghost aggregates.
+ */
+export const SNAPSHOT_VERSION = 2;
 
 export interface SignalStoreOptions {
 	flushMs?: number;
@@ -66,15 +70,28 @@ interface SignalsSnapshot {
 	version: number;
 	writerId: string;
 	generatedAt: number;
-	/** The timestamp of the newest event folded into `index`. Events at or below this are
-	 *  ALREADY counted — replaying them would double the sums. See `compact()`. */
-	upTo: number;
+	/**
+	 * shard id -> the timestamp of the newest event OF THAT SHARD folded into `index`.
+	 * Events at or below a shard's watermark are ALREADY counted — replaying them would
+	 * double the sums. A shard with no entry has contributed nothing yet.
+	 *
+	 * The map (rather than one scalar) is what makes a snapshot a fold of ALL shards while
+	 * each shard's log is still truncated independently, by whoever owns it.
+	 */
+	consumed: Record<string, number>;
 	index: SignalsIndex;
+}
+
+/** A snapshot as the reader uses it. `generatedAt` picks the freshest one. */
+interface LoadedSnapshot {
+	index: SignalsIndex;
+	consumed: Record<string, number>;
+	generatedAt: number;
 }
 
 type ResolvedOptions = Required<SignalStoreOptions>;
 
-const EMPTY_SNAPSHOT: { index: SignalsIndex; upTo: number } = { index: {}, upTo: 0 };
+const EMPTY_SNAPSHOT: LoadedSnapshot = { index: {}, consumed: {}, generatedAt: 0 };
 
 /** 8 random hex chars. Uses the WEB crypto global (present in the renderer and on mobile);
  *  importing `node:crypto` would crash the mobile bundle at load time. */
@@ -137,9 +154,16 @@ export class SignalStore {
 		return normalizePath(`${this.dir}/${this.writerId}.snapshot.json`);
 	}
 
-	/** True when this plugin currently owns the append. */
+	/** True when this plugin currently appends AT LEAST ONE event kind. */
 	get isWriter(): boolean {
 		return SignalsBroker.isWriter(this.pluginId);
+	}
+
+	/** True when this plugin currently appends events of `kind`. The slot is per kind: this
+	 *  plugin can own `edit` while another owns `open`, which is the only reason Note Decay
+	 *  and Effort Index can both record what they need with both installed. */
+	isWriterFor(kind: SignalKind): boolean {
+		return SignalsBroker.isWriterFor(this.pluginId, kind);
 	}
 
 	/** Creates the signals folder, seals a torn tail, counts the existing shard. Idempotent. */
@@ -175,11 +199,15 @@ export class SignalStore {
 	 */
 	record(event: SignalEvent): void {
 		if (this._disposed) return;
-		if (!SignalsBroker.claimIfVacant(this.app, this.pluginId, this)) return;
+		// Validate BEFORE electing: a malformed event must not claim a kind (its `k` is junk),
+		// and it must not be able to poison the batch it would sit in.
 		if (!isSignalEvent(event)) {
 			console.error("second-read: refusing to record a malformed signal event", event);
 			return;
 		}
+		// The slot is per KIND. Note Decay emits open/rename/delete and Effort Index emits
+		// edit/dwell — a per-plugin slot silently dropped one plugin's entire event set.
+		if (!SignalsBroker.claimIfVacant(this.app, this.pluginId, this, event.k)) return;
 		this.buffer.push(event);
 		this.scheduleFlush();
 	}
@@ -199,66 +227,55 @@ export class SignalStore {
 	}
 
 	/**
-	 * Every shard, merged: snapshots first, then the un-consumed tail of each log folded on
-	 * top, plus this store's own not-yet-flushed buffer so a reader inside the writer plugin
-	 * sees its own most recent events.
+	 * Every shard, folded in ONE pass: the freshest snapshot as the prior, then each shard's
+	 * un-consumed log tail on top, plus this store's own not-yet-flushed buffer so a reader
+	 * inside the writer plugin sees its own most recent events.
 	 *
-	 * Folding ALL shards' events in one pass (rather than per shard) is what makes a
-	 * `rename` or `delete` recorded by one plugin apply to the other plugin's aggregates.
+	 * Folding all shards' events together (rather than per shard) is what makes a `rename` or
+	 * `delete` recorded by ONE plugin apply to the OTHER plugin's aggregates — the two
+	 * plugins own different event kinds and write different shards, so a delete is always
+	 * "somebody else's event" to somebody.
 	 */
 	async readIndex(): Promise<SignalsIndex> {
-		const priors: SignalsIndex[] = [];
-		const events: SignalEvent[] = [];
-
-		for (const shard of await this.listShards()) {
-			const snapshot = await this.readSnapshot(normalizePath(`${this.dir}/${shard}.snapshot.json`));
-			priors.push(snapshot.index);
-			const parsed = parseSignalLog(await this.readIfExists(normalizePath(`${this.dir}/${shard}.ndjson`)));
-			for (const event of parsed.events) {
-				if (event.t > snapshot.upTo) events.push(event);
-			}
-		}
+		const { snapshot, events } = await this.gather();
 		for (const event of this.buffer) events.push(event);
-
-		return foldSignals(events, mergeSignals(priors), this.foldOptions());
+		return foldSignals(events, snapshot.index, this.foldOptions());
 	}
 
 	/**
-	 * Fold this shard's log into its snapshot and truncate the log.
+	 * Fold every shard into a snapshot and truncate OUR log. Serialised through `this.chain`
+	 * like every other write: it is public (the settings tab calls it to prune deleted notes),
+	 * and running it beside an in-flight `flush()` would read the log, let the flush append,
+	 * and then truncate the file — silently eating the events that had just landed.
 	 *
-	 * ORDER MATTERS: snapshot FIRST, truncate SECOND. A crash between the two leaves both
-	 * the snapshot and the full log on disk — which would double-count every event, except
-	 * that the snapshot records `upTo`, the timestamp of the newest event it consumed, and
-	 * `readIndex()` skips log events at or below it. So a crash at any point in this
-	 * sequence costs nothing: worst case the log is replayed and the watermark discards it.
+	 * WHAT THE SNAPSHOT CONTAINS. Everything: the fold of every shard's events, not just our
+	 * own. The previous shape (one snapshot per shard, holding only that shard's events)
+	 * could not survive a cross-shard mutation — Effort Index writes `A.md` into shard E and
+	 * compacts; Note Decay records `delete A.md` into shard D and compacts; D folds the delete
+	 * against D's index, where `A.md` does not exist, deletes nothing, and truncates the event
+	 * away. `A.md` is then a permanent ghost in E's snapshot that no later compaction can ever
+	 * reap. A single complete index plus a PER-SHARD watermark fixes that: an event is
+	 * consumed exactly once (by whichever snapshot folded it), every shard's log is still
+	 * truncated only by its own owner, and a delete applies to the whole vault.
 	 *
-	 * `livePaths` (from `vault.getMarkdownFiles()`) drops aggregates for notes that no
-	 * longer exist. Omit it and nothing is pruned by path — never guess a note is gone.
+	 * ORDER MATTERS: snapshot FIRST, truncate SECOND. A crash between the two leaves both the
+	 * snapshot and the full log on disk — which would double-count every event, except that
+	 * the snapshot records the newest event it consumed FROM EACH SHARD and the reader skips
+	 * log events at or below their shard's watermark. So a crash at any point in this sequence
+	 * costs nothing: worst case the log is replayed and the watermark discards it.
+	 *
+	 * `livePaths` (from `vault.getMarkdownFiles()`) drops aggregates for notes that no longer
+	 * exist. Omit it and nothing is pruned by path — never guess a note is gone.
 	 */
-	async compact(livePaths?: Set<string> | null, now: number = Date.now()): Promise<void> {
-		await this.init();
-		const adapter = this.app.vault.adapter;
-
-		const snapshot = await this.readSnapshot(this.snapshotPath);
-		const parsed = parseSignalLog(await this.readIfExists(this.logPath));
-		const fresh = parsed.events.filter((event) => event.t > snapshot.upTo);
-
-		let index = foldSignals(fresh, snapshot.index, this.foldOptions());
-		index = pruneSignals(index, livePaths ?? null, now, this.opts.retentionMs);
-
-		let upTo = snapshot.upTo;
-		for (const event of parsed.events) if (event.t > upTo) upTo = event.t;
-
-		const payload: SignalsSnapshot = {
-			version: SNAPSHOT_VERSION,
-			writerId: this.writerId,
-			generatedAt: now,
-			upTo,
-			index,
-		};
-		await adapter.write(this.snapshotPath, JSON.stringify(payload));
-		await adapter.write(this.logPath, "");
-		this.lines = 0;
+	compact(livePaths?: Set<string> | null, now: number = Date.now()): Promise<void> {
+		this.chain = this.chain
+			.then(() => this.doCompact(livePaths ?? null, now))
+			.catch((error) => {
+				// A failed compaction leaves the log intact — it is only ever truncated after
+				// the snapshot has landed. Nothing is lost; the next one tries again.
+				console.error("second-read: failed to compact signals", error);
+			});
+		return this.chain;
 	}
 
 	/** The "Clear activity log" button. Erases every shard, not just ours — the user asked
@@ -311,11 +328,74 @@ export class SignalStore {
 
 	private async appendBatch(events: SignalEvent[]): Promise<void> {
 		await this.init();
+		await this.appendLines(events);
+		// Already ON the chain — call doCompact directly. Going through the public compact()
+		// would enqueue behind the promise we are currently inside and deadlock.
+		if (this.lines >= this.opts.maxLines) await this.doCompact(null, Date.now());
+	}
+
+	private async appendLines(events: SignalEvent[]): Promise<void> {
+		if (events.length === 0) return;
 		const payload = events.map(serializeEvent).join("");
 		// One `append` per batch. The adapter creates the file if it is missing.
 		await this.app.vault.adapter.append(this.logPath, payload);
 		this.lines += events.length;
-		if (this.lines >= this.opts.maxLines) await this.compact();
+	}
+
+	/** The freshest snapshot, plus every shard's log events that it has NOT already consumed. */
+	private async gather(): Promise<{ snapshot: LoadedSnapshot; events: SignalEvent[] }> {
+		const shards = await this.listShards();
+
+		let snapshot = EMPTY_SNAPSHOT;
+		for (const shard of shards) {
+			const candidate = await this.readSnapshot(normalizePath(`${this.dir}/${shard}.snapshot.json`));
+			// The freshest snapshot is the fold of EVERY shard, so exactly one of them is the
+			// prior. Merging them all would double-count every event they both consumed.
+			if (candidate.generatedAt >= snapshot.generatedAt) snapshot = candidate;
+		}
+
+		const events: SignalEvent[] = [];
+		const newest: Record<string, number> = Object.create(null);
+		for (const shard of shards) {
+			const parsed = parseSignalLog(await this.readIfExists(normalizePath(`${this.dir}/${shard}.ndjson`)));
+			const watermark = snapshot.consumed[shard] ?? 0;
+			let high = watermark;
+			for (const event of parsed.events) {
+				if (event.t > watermark) events.push(event);
+				if (event.t > high) high = event.t;
+			}
+			newest[shard] = high;
+		}
+		return { snapshot: { ...snapshot, consumed: { ...snapshot.consumed, ...newest } }, events };
+	}
+
+	private async doCompact(livePaths: Set<string> | null, now: number): Promise<void> {
+		await this.init();
+		const adapter = this.app.vault.adapter;
+
+		// Land the buffer before we fold. Otherwise a buffered event would be appended AFTER
+		// the watermark that already covers its timestamp, and the reader would skip it.
+		const pending = this.buffer;
+		this.buffer = [];
+		await this.appendLines(pending);
+
+		const { snapshot, events } = await this.gather();
+		let index = foldSignals(events, snapshot.index, this.foldOptions());
+		index = pruneSignals(index, livePaths, now, this.opts.retentionMs);
+
+		const payload: SignalsSnapshot = {
+			version: SNAPSHOT_VERSION,
+			writerId: this.writerId,
+			generatedAt: now,
+			consumed: snapshot.consumed,
+			index,
+		};
+		await adapter.write(this.snapshotPath, JSON.stringify(payload));
+		// Only OUR shard. Another plugin owns its log file and may be appending to it right
+		// now; its events are already in the snapshot above and its watermark says so, so it
+		// will truncate them itself on its own next compaction.
+		await adapter.write(this.logPath, "");
+		this.lines = 0;
 	}
 
 	private async readIfExists(path: string): Promise<string> {
@@ -330,8 +410,9 @@ export class SignalStore {
 	}
 
 	/** A corrupt snapshot must degrade to "no snapshot" (the log is still authoritative),
-	 *  never to a crash on load. */
-	private async readSnapshot(path: string): Promise<{ index: SignalsIndex; upTo: number }> {
+	 *  never to a crash on load. A snapshot from an older SNAPSHOT_VERSION is discarded the
+	 *  same way — its watermark means something different and replaying the log is safe. */
+	private async readSnapshot(path: string): Promise<LoadedSnapshot> {
 		const text = await this.readIfExists(path);
 		if (text.trim() === "") return EMPTY_SNAPSHOT;
 		let parsed: unknown;
@@ -345,8 +426,18 @@ export class SignalStore {
 		const snapshot = parsed as Partial<SignalsSnapshot>;
 		if (snapshot.version !== SNAPSHOT_VERSION) return EMPTY_SNAPSHOT;
 		if (!snapshot.index || typeof snapshot.index !== "object") return EMPTY_SNAPSHOT;
-		const upTo = typeof snapshot.upTo === "number" && Number.isFinite(snapshot.upTo) ? snapshot.upTo : 0;
-		return { index: snapshot.index, upTo };
+
+		const consumed: Record<string, number> = Object.create(null);
+		if (snapshot.consumed && typeof snapshot.consumed === "object") {
+			for (const [shard, value] of Object.entries(snapshot.consumed)) {
+				if (typeof value === "number" && Number.isFinite(value)) consumed[shard] = value;
+			}
+		}
+		const generatedAt =
+			typeof snapshot.generatedAt === "number" && Number.isFinite(snapshot.generatedAt)
+				? snapshot.generatedAt
+				: 0;
+		return { index: snapshot.index, consumed, generatedAt };
 	}
 
 	/** Distinct writer ids with a file in the signals folder. */

@@ -56,6 +56,9 @@ export class EngineInstallModal extends Modal {
 
 		contentEl.createEl("p", {
 			cls: "second-read-engine-lede",
+			// "Second Read" is the product name, and sentence case does not lowercase a
+			// proper noun — the rule cannot know that.
+			// eslint-disable-next-line obsidianmd/ui/sentence-case
 			text: "Second Read will download a program and run it on your computer.",
 		});
 
@@ -76,6 +79,8 @@ export class EngineInstallModal extends Modal {
 		const source = contentEl.createEl("p", { cls: "second-read-engine-source" });
 		source.createSpan({ text: "Source: " });
 		source.createEl("a", {
+			// A URL, printed the way the user would type it. "GitHub.com/..." is not a thing.
+			// eslint-disable-next-line obsidianmd/ui/sentence-case
 			text: "github.com/israerusan/second-read-engine",
 			href: SOURCE_REPO_URL,
 			attr: { target: "_blank", rel: "noopener noreferrer" },

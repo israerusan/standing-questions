@@ -38,9 +38,13 @@ export const PRO_TAGLINE =
 export const PRO_UNLOCK_SUMMARY =
 	"semantic lead detection — new notes that may answer a question you asked months ago";
 
-/** Contextual upsell copy, keyed by the feature the user reached for. */
-export const PRO_UPSELL: Record<string, string> = {
-	semanticLeads:
-		"Matching a new note against your open questions by meaning is a Pro feature. Keyword leads work for free, on every device. " +
-		PRO_TAGLINE,
-};
+/**
+ * There is no PRO_UPSELL table and no upsell modal, on purpose.
+ *
+ * The one Pro feature (`semanticLeads`) is also an ENGINE feature, and its command is hidden
+ * from the palette entirely via checkCallback — a command that always opens a sales modal is a
+ * command that should not have been in the palette. The only surface a free user can see and
+ * click is the locked settings row, which links to the Pro card that SettingsTab.renderProCard()
+ * already draws. A second upsell path would be a second set of CSS classes to keep in sync with
+ * styles.css, which is precisely how this repo ended up shipping `note-decay-*` class names.
+ */

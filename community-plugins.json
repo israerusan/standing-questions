@@ -2,7 +2,7 @@
   {
     "id": "standing-questions",
     "name": "Standing Questions",
-    "author": "saiken",
+    "author": "Israel Avila",
     "description": "Track the open questions in your vault and surface new notes that may answer them.",
     "repo": "israerusan/standing-questions"
   }

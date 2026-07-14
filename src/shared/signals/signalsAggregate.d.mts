@@ -7,7 +7,7 @@ export const DEFAULT_DWELL_CAP_MS: number;
 export const DEFAULT_IDLE_CUTOFF_MS: number;
 export const DEFAULT_RETENTION_MS: number;
 export const SIGNALS_MAX_LINES: number;
-export const EVENT_KINDS: readonly string[];
+export const EVENT_KINDS: readonly SignalKind[];
 
 export interface OpenEvent {
 	t: number;
@@ -43,6 +43,11 @@ export interface DeleteEvent {
 }
 
 export type SignalEvent = OpenEvent | EditEvent | DwellEvent | RenameEvent | DeleteEvent;
+
+/** The closed set of event kinds. The writer slot is elected PER KIND (see SignalsBroker):
+ *  Note Decay emits open/rename/delete, Effort Index emits edit/dwell, and a per-plugin
+ *  election would drop one of those sets entirely. */
+export type SignalKind = SignalEvent["k"];
 
 export interface NoteSignals {
 	/** ms — the first moment this store observed the note at all. */

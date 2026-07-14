@@ -7,6 +7,12 @@ import assert from "node:assert";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	ENGINE_ASSET_SHA256,
+	ENGINE_RELEASE_PINNED,
+	ENGINE_VERSION,
+	isPlaceholderSha256,
+} from "../src/shared/engine/engineRelease.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
@@ -66,11 +72,47 @@ assert.equal(
 );
 
 // --- The staged community-plugins entry must not drift from the manifest -----
+// This file is the literal payload of the obsidian-releases PR. Every field it shares with the
+// manifest is cross-checked, because the drift is invisible until it is public.
 const staged = JSON.parse(fs.readFileSync(path.join(root, "community-plugins.json"), "utf8"));
 const entry = staged.find((row) => row.id === manifest.id);
 assert.ok(entry, "community-plugins.json must stage an entry for this add-on");
 assert.equal(entry.name, manifest.name);
 assert.equal(entry.description, manifest.description);
+assert.equal(
+	entry.author,
+	manifest.author,
+	"community-plugins.json author must match manifest.author — it is the byline the directory shows"
+);
+
+// --- THE RELEASE GATE: do not sell a key whose only feature cannot run -------
+//
+// `semanticLeads` is the ONLY Pro feature this add-on has (core/features.mjs), and it needs the
+// semantic engine. While `ENGINE_RELEASE_PINNED === false` the engine host REFUSES to download —
+// by design, because the asset hashes are still the 64-zero placeholders and downloading an
+// executable you cannot verify is the one thing this install flow exists to never do. So the
+// "Download engine" button is disabled (SettingsTab), and semantic leads are unreachable.
+//
+// Tag 1.0.0 in that state and every buyer of the $29 suite key gets, from this add-on, nothing
+// they could not have had for free. That is the failure this gate exists to make impossible:
+// a 1.x version number is the promise that the product works. Ship 0.x until `pin-engine.mjs`
+// has run against a published `sidecar-v*` release, then bump.
+const RELEASABLE = /^[1-9]\d*\./.test(manifest.version); // major >= 1
+if (RELEASABLE) {
+	assert.ok(
+		ENGINE_RELEASE_PINNED,
+		`manifest.version is ${manifest.version} (a 1.x release) but ENGINE_RELEASE_PINNED is false — ` +
+			"the engine cannot be downloaded, so semanticLeads (the only Pro feature) is unreachable for " +
+			"every buyer. Run scripts/pin-engine.mjs against a published sidecar release, or ship 0.x."
+	);
+	assert.notEqual(ENGINE_VERSION, "0.0.0-dev", "a 1.x release must pin a real engine version");
+	for (const [target, sha256] of Object.entries(ENGINE_ASSET_SHA256)) {
+		assert.ok(
+			!isPlaceholderSha256(sha256),
+			`a 1.x release must pin a real SHA-256 for ${target} — this one is still the placeholder`
+		);
+	}
+}
 
 // --- No static import of a Node builtin anywhere in src ----------------------
 // A static `import "child_process"` compiles to a TOP-LEVEL require() in the CJS bundle and

@@ -45,7 +45,6 @@ import {
 } from "./protocol.mjs";
 import {
 	UnsupportedPlatformError,
-	executableName,
 	isAllowedDownloadUrl,
 	planForHost,
 	type InstallPlan,
@@ -79,7 +78,21 @@ export interface EngineHealth {
 export interface InstalledInfo {
 	version: string;
 	target: string;
+	/**
+	 * The digest of the ARCHIVE that was downloaded and verified. It is a receipt, not a
+	 * guard: the zip is deleted the moment it is extracted, so nothing on disk can ever be
+	 * re-checked against it. Do not reach for this to decide whether it is safe to execute
+	 * something — that is what `exeSha256` is for.
+	 */
 	sha256: string;
+	/**
+	 * The digest of the EXECUTABLE ITSELF, taken from the extracted file at install time.
+	 * `resolveExecutable()` re-computes it and refuses to spawn on a mismatch, which is the
+	 * only thing standing between "anything that can write %LOCALAPPDATA% (a dropper, a sync
+	 * client, another installer) swapped the binary" and "the next click on Test engine ran
+	 * it". Absent on records written by builds before this field existed — those fail closed.
+	 */
+	exeSha256: string;
 	installedAt: number;
 	exePath: string;
 }
@@ -126,6 +139,13 @@ export interface EngineProgress {
 export interface RequestOptions {
 	timeoutMs?: number;
 	onProgress?: (p: EngineProgress) => void;
+	/**
+	 * The request's JSON-RPC id, handed back SYNCHRONOUSLY before the frame is written to
+	 * stdin. Without this the caller never learns the id, and the `cancel` RPC (DESIGN 6.2,
+	 * method 8) can never be sent — so every superseded keystroke leaves the engine embedding
+	 * a query whose answer will be thrown away, which is most of them.
+	 */
+	onRequestId?: (id: number) => void;
 }
 
 /* ------------------------------------------------------ Node, lazily typed -- */
@@ -147,6 +167,13 @@ interface NodeApi {
 /** ~45 MB over a bad hotel connection is still under this. */
 const DOWNLOAD_STALL_MS = 60_000;
 const MAX_REDIRECTS = 5;
+/**
+ * A hard ceiling on the download, and a second ceiling at 4x whatever Content-Length the
+ * server claimed. The SHA-256 is only checked once the bytes have LANDED, so without a cap an
+ * allowlisted-but-compromised host (or a GitHub account takeover) can stream unbounded bytes
+ * into the user's %LOCALAPPDATA% before we ever get to reject them. The engine zip is ~45 MB.
+ */
+const MAX_DOWNLOAD_BYTES = 400 * 1024 * 1024;
 const HEALTH_TIMEOUT_MS = 15_000;
 const STDERR_RING_LINES = 200;
 const IDLE_EXIT_SECONDS = 600;
@@ -239,10 +266,29 @@ interface Settle {
 
 export class EngineHost {
 	private readonly app: App;
+	/**
+	 * pluginId -> that plugin's engine settings. The host is SHARED by up to five plugins, so
+	 * "the engine path" is not one value: each plugin has its own settings tab with its own
+	 * "Path to an existing engine" field, and they all point at this one object.
+	 *
+	 * Keeping only the last-written settings object (what this used to do) broke the BYO path
+	 * both ways: a plugin that acquired the host later had its configured path DISCARDED, and
+	 * a plugin saving any unrelated setting overwrote the shared settings with its own empty
+	 * `enginePath` and WIPED another plugin's. That escape hatch is the documented answer to
+	 * Defender quarantine / noexec / Flatpak / Gatekeeper, so it silently doing nothing for
+	 * four plugins out of five is not a small bug.
+	 *
+	 * Resolution is "the first non-empty path, by plugin id". The empty-string key is the
+	 * bucket for a caller that did not identify itself; it sorts first, so a path the user
+	 * just typed into some settings tab takes effect immediately for every plugin.
+	 */
+	private readonly settingsByPlugin = new Map<string, EngineSettings>();
 	private settings: EngineSettings;
 	private readonly node: NodeApi | null;
 
 	private child: { pid?: number; stdin: any; stdout: any; stderr: any; kill: (s?: string) => void } | null = null; // eslint-disable-line @typescript-eslint/no-explicit-any
+	/** The exe we spawned, kept so a kill can verify it is still killing OUR process. */
+	private childExePath: string | null = null;
 	private decoder = new FrameDecoder();
 	private pending = new PendingRequests<Settle>();
 	private sweepTimer: number | null = null;
@@ -255,18 +301,47 @@ export class EngineHost {
 	private stderrTail = "";
 	private disposed = false;
 
-	constructor(app: App, settings: EngineSettings) {
+	constructor(app: App, settings: EngineSettings, pluginId = "") {
 		this.app = app;
-		this.settings = { ...settings };
+		this.settingsByPlugin.set(pluginId, { ...settings });
+		this.settings = {};
+		this.resolveSettings();
 		this.node = loadNode();
 		if (!this.node) this.state = "unsupported";
 	}
 
 	/* --------------------------------------------------------- introspection */
 
-	/** The plugin's engine settings changed (e.g. the user typed a BYO path). Not a restart. */
-	updateSettings(settings: EngineSettings): void {
-		this.settings = { ...settings };
+	/**
+	 * One plugin's engine settings changed (e.g. the user typed a BYO path). Not a restart.
+	 *
+	 * ALWAYS pass `pluginId`. Omitting it lands the settings in the shared anonymous bucket,
+	 * which works — it is how a path typed into any settings tab reaches the other plugins —
+	 * but it cannot express "THIS plugin cleared its path", so a clear will not take effect
+	 * until the next reload.
+	 */
+	updateSettings(settings: EngineSettings, pluginId = ""): void {
+		this.settingsByPlugin.set(pluginId, { ...settings });
+		this.resolveSettings();
+	}
+
+	/** A plugin released its ref. Drop its contribution so its BYO path stops applying. */
+	forgetPlugin(pluginId: string): void {
+		if (!this.settingsByPlugin.delete(pluginId)) return;
+		this.resolveSettings();
+	}
+
+	/** First non-empty `enginePath`, by plugin id. The anonymous bucket ("") sorts first. */
+	private resolveSettings(): void {
+		let enginePath: string | undefined;
+		for (const pluginId of [...this.settingsByPlugin.keys()].sort()) {
+			const candidate = (this.settingsByPlugin.get(pluginId)?.enginePath ?? "").trim();
+			if (candidate) {
+				enginePath = candidate;
+				break;
+			}
+		}
+		this.settings = { enginePath };
 	}
 
 	get desktop(): boolean {
@@ -275,6 +350,17 @@ export class EngineHost {
 
 	isAlive(): boolean {
 		return this.child !== null;
+	}
+
+	/**
+	 * True once this host has been permanently torn down. `dispose()` latches this forever, so
+	 * a disposed host rejects EVERY request — including the `health` handshake inside a fresh
+	 * `install()`. EngineBroker MUST check it before handing a cached host to a plugin, or one
+	 * plugin's "Remove engine" click poisons the engine for every other Second Read add-on in
+	 * the realm until Obsidian is restarted.
+	 */
+	isDisposed(): boolean {
+		return this.disposed;
 	}
 
 	/** Last 200 stderr lines — the settings "Engine log" disclosure. */
@@ -424,12 +510,17 @@ export class EngineHost {
 		// 5. Spawn + handshake.
 		onProgress?.({ phase: "starting" });
 		const real: string = await fs.promises.realpath(exePath);
+		// Taken BEFORE the spawn, from the bytes we just verified and extracted ourselves. This
+		// is the value every later start is checked against; the archive digest above cannot do
+		// that job, because the archive no longer exists.
+		const exeSha256 = await this.hashFile(node, real);
 		const health = await this.startAt(node, real);
 
 		const info: InstalledInfo = {
 			version: plan.version,
 			target: plan.target,
 			sha256: plan.sha256,
+			exeSha256,
 			installedAt: Date.now(),
 			exePath: real,
 		};
@@ -440,16 +531,26 @@ export class EngineHost {
 		return health;
 	}
 
-	/** Kill the child, delete the binaries, forget the install. The index is deliberately KEPT. */
+	/**
+	 * Kill the child, delete the binaries, forget the install. The index is deliberately KEPT.
+	 *
+	 * `dispose(true)` — NOT `dispose()`. This host is SHARED: the plain `dispose()` latches
+	 * `disposed = true` for the object's lifetime, and every other Second Read plugin holding
+	 * a ref would then get "The engine host was unloaded." from every call, including the
+	 * `health` handshake inside a fresh `install()` — so the user could not even re-download
+	 * the engine they just removed until they restarted Obsidian. Removing the binary must
+	 * leave the host usable and empty, not dead.
+	 */
 	async remove(): Promise<void> {
 		const node = this.requireNode();
-		this.dispose();
+		this.dispose(true);
 		const home = engineHome(node);
 		await this.quietRmDir(node, node.path.join(home, "bin"));
 		await this.quietRm(node, node.path.join(home, "installed.json"));
-		await this.quietRm(node, node.path.join(home, "engine.pid"));
+		await this.quietRm(node, this.pidFile(node));
 		this.state = "not-installed";
 		this.lastHealth = null;
+		this.lastError = undefined;
 	}
 
 	async readInstalled(): Promise<InstalledInfo | null> {
@@ -489,7 +590,23 @@ export class EngineHost {
 		return this.startPromise;
 	}
 
-	/** BYO path wins over anything downloaded — that is the point of it. */
+	/**
+	 * BYO path wins over anything downloaded — that is the point of it.
+	 *
+	 * THE INSTALLED PATH IS RE-VERIFIED ON EVERY START, not just at install. The checksum in
+	 * the release manifest guards the download; it does not guard the file for the rest of its
+	 * life on disk. `%LOCALAPPDATA%` / `~/.local/share` is writable by every process the user
+	 * runs, so between the install and the next "Test engine" click anything at all can have
+	 * overwritten the binary or repointed `installed.json` at one of its own — and the plugin
+	 * would spawn it, from a path it trusts, with the user's privileges. Re-hashing costs one
+	 * streaming read of ~50 MB once per engine start, which is nothing next to the model load
+	 * that follows it. Fail CLOSED: a record with no `exeSha256` (an older build wrote it) is
+	 * refused too, because "no checksum" and "a checksum an attacker chose" are the same claim.
+	 *
+	 * The BYO path is deliberately NOT hashed: the user pointed at that file themselves, we
+	 * have no digest to compare it to, and inventing one (trust-on-first-use) would only mean
+	 * recording whatever was there the first time we looked.
+	 */
 	private async resolveExecutable(): Promise<string | null> {
 		const node = this.requireNode();
 		const byo = (this.settings.enginePath ?? "").trim();
@@ -504,17 +621,63 @@ export class EngineHost {
 		}
 		const installed = await this.readInstalled();
 		if (!installed) return null;
+
+		let real: string;
 		try {
-			return await node.fs.promises.realpath(installed.exePath);
+			real = await node.fs.promises.realpath(installed.exePath);
 		} catch {
 			return null;
 		}
+
+		const expected = String(installed.exeSha256 ?? "").toLowerCase();
+		if (!/^[0-9a-f]{64}$/.test(expected)) {
+			this.state = "error";
+			this.lastError =
+				"The engine install record has no checksum for the binary, so it was not started. Remove the engine and download it again.";
+			return null;
+		}
+
+		let actual: string;
+		try {
+			actual = await this.hashFile(node, real);
+		} catch {
+			this.state = "error";
+			this.lastError = "The installed engine binary could not be read, so it was not started.";
+			return null;
+		}
+		if (actual !== expected) {
+			this.state = "error";
+			this.lastError =
+				"The installed engine binary does not match the checksum recorded when it was installed, so it was NOT started. Something replaced it. Remove the engine and download it again.";
+			return null;
+		}
+		return real;
+	}
+
+	/**
+	 * SHA-256 of a file on disk, streamed a megabyte at a time — the engine binary is tens of
+	 * megabytes and `readFile` would hold all of it in the renderer's heap at once.
+	 */
+	private async hashFile(node: NodeApi, target: string): Promise<string> {
+		const hash = node.crypto.createHash("sha256");
+		const handle = await node.fs.promises.open(target, "r");
+		try {
+			const buffer = new Uint8Array(1 << 20);
+			for (;;) {
+				const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+				if (bytesRead <= 0) break;
+				hash.update(buffer.subarray(0, bytesRead));
+			}
+		} finally {
+			await handle.close();
+		}
+		return String(hash.digest("hex")).toLowerCase();
 	}
 
 	private async startAt(node: NodeApi, exePath: string): Promise<EngineHealth> {
 		this.state = "starting";
 		this.lastError = undefined;
-		await this.reapOrphan(node, exePath);
+		await this.reapOrphan(node);
 
 		const parentPid: number = node.proc.pid;
 		const cwd: string = node.path.dirname(exePath);
@@ -538,6 +701,7 @@ export class EngineHost {
 		}
 
 		this.child = child;
+		this.childExePath = exePath;
 		this.decoder.reset();
 
 		child.stdout.setEncoding("utf8");
@@ -602,6 +766,10 @@ export class EngineHost {
 					onProgress: options?.onProgress,
 				},
 			});
+			// BEFORE the write, synchronously: the caller needs the id in order to cancel this
+			// request, and a `query` that completes in one frame emits no progress notification,
+			// so there is no other moment at which it could ever learn it.
+			options?.onRequestId?.(id);
 			try {
 				child.stdin.write(encodeRequest(id, method, params));
 			} catch (err) {
@@ -713,8 +881,10 @@ export class EngineHost {
 		if (!keepDisposedFlag) this.disposed = true;
 		const node = this.node;
 		const child = this.child;
+		const exePath = this.childExePath;
 		this.stopSweep();
 		this.child = null;
+		this.childExePath = null;
 		this.lastHealth = null;
 		for (const entry of this.pending.drain()) {
 			entry.meta?.reject(new EngineRpcError(ERROR_CODES.IO_ERROR, "The engine was stopped."));
@@ -733,69 +903,183 @@ export class EngineHost {
 			/* already gone */
 		}
 
-		if (node.os.platform() === "win32" && typeof pid === "number") {
-			// SIGTERM is not a thing on Windows; a PyInstaller onedir also has no children
-			// of its own, but /T is free insurance against one appearing.
+		if (node.os.platform() === "win32" && typeof pid === "number" && exePath) {
+			// SIGTERM is not a thing on Windows; a PyInstaller onedir also has no children of
+			// its own, but /T is free insurance against one appearing. The two-second grace is
+			// long enough for the OS to have recycled this pid onto somebody else's process, so
+			// the kill is identity-checked rather than fired blind at a number.
 			window.setTimeout(() => {
-				try {
-					node.cp.execFile("taskkill", ["/PID", String(pid), "/T", "/F"], () => undefined);
-				} catch {
-					/* nothing left to kill */
-				}
+				void this.killIfEngine(node, pid, exePath, "shutdown");
 			}, WIN_KILL_GRACE_MS);
 		}
-		void this.quietRm(node, node.path.join(engineHome(node), "engine.pid"));
+		void this.quietRm(node, this.pidFile(node));
 	}
 
 	/* ----------------------------------------------------------- pid safety */
 
 	/**
-	 * We record the pid we spawned. If Obsidian is killed (crash, force-quit) neither
-	 * dispose() nor stdin-EOF runs, and only the sidecar's own --parent-pid watchdog
-	 * would reap it — up to 5 s later, and never at all if that watchdog regressed.
-	 * So on the next start we kill anything still recorded here, but ONLY if the
-	 * recorded exe path is the one we are about to launch: a recycled pid belonging to
-	 * some other program must never be touched.
+	 * THE PID FILE IS PER VAULT. It used to be one machine-wide `engine.pid`, and that is a
+	 * bug with teeth: open vault A (engine pid 1234, recorded), then open vault B in a second
+	 * window. B's start reads the record, sees a matching exe path and a pid that is very much
+	 * alive — because it is A's LIVE engine, not an orphan — and taskkill /T /F's it. A's next
+	 * request respawns and reaps B's. The two windows ping-pong forever and the semantic
+	 * features thrash in both. Scoping the file by vault key means a window can only ever reap
+	 * an engine belonging to the vault it has open.
+	 */
+	private pidFile(node: NodeApi): string {
+		return node.path.join(engineHome(node), `engine.${this.vaultKey()}.pid`);
+	}
+
+	/**
+	 * Record what we spawned. If Obsidian is killed (crash, force-quit) neither dispose() nor
+	 * stdin-EOF runs, and only the sidecar's own --parent-pid watchdog would reap it — up to
+	 * 5 s later, and never at all if that watchdog regressed. So the next start reaps whatever
+	 * is still recorded here.
+	 *
+	 * `parentPid` is what makes that safe. A record whose parent is still running is not an
+	 * orphan; it belongs to a live session and must never be touched.
 	 */
 	private async writePid(node: NodeApi, pid: number | undefined, exePath: string): Promise<void> {
 		if (typeof pid !== "number") return;
 		try {
 			await node.fs.promises.writeFile(
-				node.path.join(engineHome(node), "engine.pid"),
-				JSON.stringify({ pid, exePath, startedAt: Date.now() }) + "\n"
+				this.pidFile(node),
+				JSON.stringify({
+					pid,
+					exePath,
+					parentPid: node.proc.pid,
+					vaultKey: this.vaultKey(),
+					startedAt: Date.now(),
+				}) + "\n"
 			);
 		} catch {
 			/* a missing pid file costs us a slower reap, nothing more */
 		}
 	}
 
-	private async reapOrphan(node: NodeApi, exePath: string): Promise<void> {
-		const pidFile = node.path.join(engineHome(node), "engine.pid");
-		let record: { pid?: number; exePath?: string } | null = null;
+	/**
+	 * Kill the engine a previous session left behind — and NOTHING else.
+	 *
+	 * Two ways the old version killed a stranger, both of them real:
+	 *  1. A live sibling. Fixed by the per-vault pid file plus the parent check below: a
+	 *     record whose parent process is still alive is a running session, not an orphan.
+	 *  2. Pid reuse. `engine.pid` survives a crash AND a reboot; Windows pids are small and
+	 *     recycled aggressively, so "something is alive at pid 1234" says nothing about WHAT.
+	 *     The liveness probe passed and the host ran `taskkill /PID 1234 /T /F` on whatever
+	 *     now owned that number. Fixed by verifying the live process's image name against the
+	 *     executable we recorded before any signal is sent.
+	 */
+	private async reapOrphan(node: NodeApi): Promise<void> {
+		const pidFile = this.pidFile(node);
+		let record: { pid?: number; exePath?: string; parentPid?: number } | null = null;
 		try {
 			record = JSON.parse(await node.fs.promises.readFile(pidFile, "utf8"));
 		} catch {
 			return;
 		}
-		if (!record || typeof record.pid !== "number" || record.exePath !== exePath) return;
-		if (record.pid === node.proc.pid) return;
+		if (!record || typeof record.pid !== "number" || typeof record.exePath !== "string") return;
+		if (record.pid === node.proc.pid) return; // never, ever signal the renderer
+
+		// Is anything alive at that pid at all?
 		try {
 			node.proc.kill(record.pid, 0); // liveness probe; throws ESRCH when gone
 		} catch {
 			await this.quietRm(node, pidFile);
 			return;
 		}
-		try {
-			if (node.os.platform() === "win32") {
-				node.cp.execFile("taskkill", ["/PID", String(record.pid), "/T", "/F"], () => undefined);
-			} else {
-				node.proc.kill(record.pid, "SIGTERM");
+
+		// Is the session that spawned it gone? A live parent means a live sibling — another
+		// window with this vault open, or this very renderer having already started an engine.
+		// Only our own renderer's leftovers are ours to reap.
+		if (typeof record.parentPid === "number" && record.parentPid !== node.proc.pid) {
+			let parentAlive = true;
+			try {
+				node.proc.kill(record.parentPid, 0);
+			} catch {
+				parentAlive = false;
 			}
+			if (parentAlive) {
+				this.pushLog(
+					`[host] engine pid ${record.pid} belongs to a live session (parent ${record.parentPid}) — leaving it alone`
+				);
+				return;
+			}
+		}
+
+		const killed = await this.killIfEngine(node, record.pid, record.exePath, "orphan");
+		if (killed) {
 			this.pushLog(`[host] reaped an orphaned engine (pid ${record.pid}) left by a previous session`);
-		} catch {
-			/* nothing to do */
 		}
 		await this.quietRm(node, pidFile);
+	}
+
+	/**
+	 * Signal `pid` ONLY if the process actually running under it is the engine we think it is.
+	 * A pid is not an identity — it is a number the OS hands out again the moment it is free.
+	 */
+	private async killIfEngine(node: NodeApi, pid: number, exePath: string, why: string): Promise<boolean> {
+		const expected = String(node.path.basename(exePath)).toLowerCase();
+		const actual = (await this.processImageName(node, pid))?.toLowerCase() ?? null;
+		if (!actual) return false; // it exited, or we cannot tell — either way, do not shoot
+		// POSIX `comm` truncates at 15 chars, so compare on the prefix rather than for equality.
+		const matches = actual === expected || expected.startsWith(actual) || actual.startsWith(expected);
+		if (!matches) {
+			this.pushLog(`[host] pid ${pid} is "${actual}", not "${expected}" — refusing to kill it (${why})`);
+			return false;
+		}
+		try {
+			if (node.os.platform() === "win32") {
+				node.cp.execFile("taskkill", ["/PID", String(pid), "/T", "/F"], () => undefined);
+			} else {
+				node.proc.kill(pid, "SIGTERM");
+			}
+			return true;
+		} catch {
+			return false; // it died between the check and the signal. Fine.
+		}
+	}
+
+	/** The image name of the process at `pid`, or null when there is nothing there (or we
+	 *  cannot find out — in which case the caller must not kill). */
+	private processImageName(node: NodeApi, pid: number): Promise<string | null> {
+		const win32 = node.os.platform() === "win32";
+		const command = win32 ? "tasklist" : "ps";
+		const args = win32
+			? ["/FI", `PID eq ${String(pid)}`, "/FO", "CSV", "/NH"]
+			: ["-p", String(pid), "-o", "comm="];
+
+		return new Promise<string | null>((resolve) => {
+			try {
+				node.cp.execFile(
+					command,
+					args,
+					{ timeout: 5_000, windowsHide: true },
+					(err: unknown, stdout: string) => {
+						if (err || typeof stdout !== "string") {
+							resolve(null);
+							return;
+						}
+						const text = stdout.trim();
+						if (!text) {
+							resolve(null);
+							return;
+						}
+						if (win32) {
+							// `"embed-sidecar.exe","1234","Console","1","96,152 K"`, or an
+							// INFO: line when the filter matched nothing.
+							const match = /^"([^"]+)"/.exec(text);
+							resolve(match ? match[1] : null);
+							return;
+						}
+						// `ps -o comm=` prints the command, possibly a full path.
+						const first = text.split("\n")[0].trim();
+						resolve(first ? String(node.path.basename(first)) : null);
+					}
+				);
+			} catch {
+				resolve(null);
+			}
+		});
 	}
 
 	/* ------------------------------------------------------------ download */
@@ -819,9 +1103,19 @@ export class EngineHost {
 		return new Promise<string>((resolve, reject) => {
 			let hops = 0;
 			let settled = false;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			let out: any = null;
 			const fail = (err: unknown) => {
 				if (settled) return;
 				settled = true;
+				// Destroy the write stream. Rejecting the promise does not close the fd: on a
+				// mid-download network drop it leaked, and on Windows the quietRm(tmpZip) that
+				// follows would then lose to an EBUSY and leave a half-downloaded .part behind.
+				try {
+					out?.destroy();
+				} catch {
+					/* already closed */
+				}
 				reject(
 					err instanceof EngineRpcError
 						? err
@@ -865,12 +1159,29 @@ export class EngineHost {
 						}
 
 						const total = Number(res.headers?.["content-length"] ?? 0) || 0;
+						// The checksum can only be checked once the bytes have landed, so the
+						// size is the only thing standing between a compromised (but
+						// allowlisted) host and an unbounded write into the user's app-data
+						// directory. Trust the server's own Content-Length to within 4x, and
+						// never past the hard ceiling whatever it claims.
+						const cap = total > 0 ? Math.min(MAX_DOWNLOAD_BYTES, total * 4) : MAX_DOWNLOAD_BYTES;
 						let done = 0;
 						const hash = crypto.createHash("sha256");
-						const out = fs.createWriteStream(dest);
+						out = fs.createWriteStream(dest);
 
 						res.on("data", (buf: Uint8Array) => {
 							done += buf.length;
+							if (done > cap) {
+								res.destroy();
+								req.destroy();
+								fail(
+									new EngineRpcError(
+										ERROR_CODES.IO_ERROR,
+										"The download is larger than the engine could possibly be — it was stopped and nothing was run."
+									)
+								);
+								return;
+							}
 							hash.update(buf);
 							onProgress(done, total);
 						});
@@ -916,11 +1227,27 @@ export class EngineHost {
 		}
 	}
 
-	/** The onedir's executable, whether or not the zip has a top-level folder. */
+	/**
+	 * The onedir's executable, whether or not the zip has a top-level folder.
+	 *
+	 * A FILE, tested with stat — not `existsSync`. PyInstaller's onedir layout routinely names
+	 * the top-level folder after the executable (`embed-sidecar/embed-sidecar`), so `existsSync`
+	 * on `<binDir>/embed-sidecar` is true for the DIRECTORY, and the installer would then record
+	 * a directory as `exePath`, spawn it, and report a confusing EACCES/EISDIR instead of
+	 * descending one level to the real binary.
+	 */
 	private async findExecutable(node: NodeApi, dir: string, exe: string): Promise<string | null> {
 		const { fs, path } = node;
+		const isFile = async (target: string): Promise<boolean> => {
+			try {
+				return (await fs.promises.stat(target)).isFile();
+			} catch {
+				return false;
+			}
+		};
+
 		const direct: string = path.join(dir, exe);
-		if (fs.existsSync(direct)) return direct;
+		if (await isFile(direct)) return direct;
 		let names: string[];
 		try {
 			names = await fs.promises.readdir(dir);
@@ -929,7 +1256,7 @@ export class EngineHost {
 		}
 		for (const name of names.sort()) {
 			const candidate: string = path.join(dir, name, exe);
-			if (fs.existsSync(candidate)) return candidate;
+			if (await isFile(candidate)) return candidate;
 		}
 		return null;
 	}

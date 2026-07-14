@@ -153,7 +153,15 @@ export default class StandingQuestionsPlugin extends Plugin {
 		this.saveTimer = null;
 		await this.saveData(this.settings);
 		this.index.updateSettings(this.settings);
-		this.engine?.updateSettings({ enginePath: this.settings.enginePath || undefined });
+		// ALWAYS with our plugin id. The host is SHARED, and it keeps one bucket of engine settings
+		// per add-on so that N add-ons cannot fight over a single global `enginePath`. Omitting the
+		// id lands our path in the anonymous bucket, which (a) sorts first and so silently outranks
+		// Prior Art's configured BYO path, and (b) is never dropped by `forgetPlugin()` on unload —
+		// so a path typed into THIS add-on would keep steering the engine after it was disabled.
+		this.engine?.updateSettings(
+			{ enginePath: this.settings.enginePath || undefined },
+			this.manifest.id
+		);
 		this.scheduleIndex();
 	}
 
@@ -400,17 +408,15 @@ export default class StandingQuestionsPlugin extends Plugin {
 	/**
 	 * Remove the engine binary. The index is deliberately kept (DESIGN 7.3 step 9).
 	 *
-	 * The release/re-acquire dance is a WORKAROUND, not a flourish. The vendored
-	 * `EngineHost.remove()` calls `dispose()`, which latches an internal `disposed` flag for the
-	 * lifetime of the object — so the shared host is permanently poisoned, and a user who removed
-	 * the engine and then clicked "Download engine" in the same session would hit "the engine host
-	 * was unloaded" during the health handshake. Dropping our ref (which kills and clears the
-	 * global when we are the last engine add-on) and re-acquiring hands us a FRESH host, so the
-	 * remove-then-reinstall path works without a restart.
-	 *
-	 * The correct fix is one character in obsidian-plugin-core — `remove()` should call
-	 * `dispose(true)` — and it is reported upstream rather than patched here, because the vendored
-	 * tree is byte-checked and must never be edited inside a plugin repo.
+	 * This used to release its ref and re-acquire, to dodge a vendored `EngineHost.remove()` that
+	 * called the unqualified `dispose()` and latched `disposed = true` for the object's lifetime.
+	 * That workaround only ever worked when this was the SOLE engine add-on: with Prior Art also
+	 * loaded the refcount never reaches zero, `release()` returns early, and `acquire()` handed
+	 * back the very same poisoned host. And when it WAS the sole add-on it disposed the host, killed
+	 * the child and swapped the object out from under everything still holding it. It is gone.
+	 * `remove()` now calls `dispose(true)` upstream, so the shared host is left usable and EMPTY —
+	 * the same object, still holding every other add-on's ref and BYO path, ready for a re-install
+	 * with no Obsidian restart. engine-shared-host.test.ts fails if any of that stops being true.
 	 */
 	async removeEngine(): Promise<void> {
 		if (!this.engine) return;
@@ -418,16 +424,14 @@ export default class StandingQuestionsPlugin extends Plugin {
 
 		await this.engine.remove();
 		this.engineIndex.reset();
-
-		EngineBroker.release(this.manifest.id);
-		this.engine = EngineBroker.acquire(this.app, this.manifest.id, {
-			enginePath: this.settings.enginePath || undefined,
-		});
 		await this.refreshEngineStatus();
 
 		if (shared.length > 0) {
+			// Their host is alive — it is the BINARY that is gone. They will report "not installed"
+			// the next time they look, and either add-on can download it again from its own settings
+			// tab. No restart, and nothing to reload.
 			new Notice(
-				"Other Second Read add-ons were using this engine. Reload Obsidian so they notice it is gone.",
+				"Other Second Read add-ons were using this engine. They will report it as not installed until it is downloaded again.",
 				10_000
 			);
 		}

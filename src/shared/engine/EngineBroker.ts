@@ -80,12 +80,32 @@ export class EngineBroker {
 			return null;
 		}
 
-		if (existing) {
+		// A DISPOSED host is dead forever — `dispose()` latches the flag and every later call
+		// throws "The engine host was unloaded.", including the `health` handshake inside a
+		// fresh install(). It only takes one plugin unloading (or an older build calling the
+		// unqualified dispose() from "Remove engine") to leave a corpse in the registry, and
+		// with two engine plugins loaded the refcount never reaches zero, so release() never
+		// clears it. Handing that corpse to the next caller poisons the engine for EVERY
+		// add-on until Obsidian restarts. Replace it instead.
+		if (existing && !existing.host.isDisposed()) {
 			existing.refs.add(pluginId);
+			// Reconcile on EVERY acquire. The host is shared, so the settings it was
+			// constructed with belong to whichever plugin happened to load first; without this
+			// the BYO "Path to an existing engine" — the documented fallback for Defender,
+			// noexec, Flatpak and Gatekeeper — silently does nothing in the other four.
+			existing.host.updateSettings(settings, pluginId);
 			return existing.host;
 		}
 
-		const host = new EngineHost(app, settings);
+		if (existing) {
+			console.warn("[second-read] The shared engine host was disposed; replacing it.");
+			// Carry the surviving refs across: those plugins are still loaded and still expect
+			// an engine, and they hold no reference to this dead object (they call
+			// EngineBroker.peek()/acquire() to get it).
+			existing.refs.delete(pluginId);
+		}
+
+		const host = new EngineHost(app, settings, pluginId);
 		if (!host.desktop) {
 			// Mobile / no window.require. Publish nothing — there is no process to share and
 			// no global to clean up. Every caller degrades to the free tier.
@@ -95,10 +115,16 @@ export class EngineBroker {
 		const registry: EngineRegistry = {
 			apiVersion: ENGINE_API_VERSION,
 			host,
-			refs: new Set([pluginId]),
+			refs: new Set([pluginId, ...(existing?.refs ?? [])]),
 		};
 		carrier()[ENGINE_GLOBAL] = registry;
 		return host;
+	}
+
+	/** One plugin's engine settings changed. Reaches the shared host with the plugin's identity
+	 *  attached, so a plugin clearing its own BYO path cannot wipe another plugin's. */
+	static updateSettings(pluginId: string, settings: EngineSettings): void {
+		readRegistry()?.host.updateSettings(settings, pluginId);
 	}
 
 	/**
@@ -110,6 +136,9 @@ export class EngineBroker {
 		const registry = readRegistry();
 		if (!registry) return;
 		registry.refs.delete(pluginId);
+		// Its BYO path leaves with it — the host is shared, and a setting from an add-on that
+		// is no longer loaded must not keep steering the other four.
+		registry.host.forgetPlugin(pluginId);
 		if (registry.refs.size > 0) return;
 
 		registry.host.dispose();
@@ -117,10 +146,12 @@ export class EngineBroker {
 		if (carrier()[ENGINE_GLOBAL] === registry) delete carrier()[ENGINE_GLOBAL];
 	}
 
-	/** The running host, without acquiring a ref. For "is the engine already up?" in settings. */
+	/** The running host, without acquiring a ref. For "is the engine already up?" in settings.
+	 *  Never hands back a disposed corpse — see acquire(). */
 	static peek(): EngineHost | null {
 		const registry = readRegistry();
 		if (!registry || registry.apiVersion !== ENGINE_API_VERSION) return null;
+		if (registry.host.isDisposed()) return null;
 		return registry.host;
 	}
 

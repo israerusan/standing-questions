@@ -4,10 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - 2026-07-14
+## [0.9.0] - 2026-07-14
 
-First release. The free tier is complete; the Pro semantic feature is gated and ships inert
-until the semantic engine has a published build.
+Release candidate. The free tier is complete; the Pro semantic feature is gated and inert until
+the semantic engine has a published build.
+
+**This is deliberately not 1.0.0.** `semanticLeads` is the only Pro feature this add-on has, and
+it cannot run until `shared/engine/engineRelease.mjs` pins a real engine release
+(`ENGINE_RELEASE_PINNED === false` today, and the engine host refuses to download a binary whose
+checksum it cannot verify). Tagging 1.0.0 now would sell a $29 key whose single feature is
+unreachable. `test/manifest-contract.test.mjs` enforces this: the version cannot cross into 1.x
+while the engine is unpinned, and the build goes red if it does.
 
 ### Added
 
@@ -64,4 +71,4 @@ until the semantic engine has a published build.
   `require()` in the CJS bundle and crashes every mobile user on load, whatever `isDesktopOnly`
   says. `test/manifest-contract.test.mjs` fails the build if one appears.
 
-[1.0.0]: https://github.com/israerusan/standing-questions/releases/tag/1.0.0
+[0.9.0]: https://github.com/israerusan/standing-questions/releases/tag/0.9.0

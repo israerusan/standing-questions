@@ -93,13 +93,18 @@ export function executableName(target) {
 }
 
 /**
- * A URL is fetchable only if it is HTTPS and on the allowlist. Parsed with a regex
- * rather than `URL` so this module needs no host globals at all — and so a
- * scheme-relative or userinfo-bearing URL (`https://github.com@evil.test/x`) cannot
- * smuggle a host past us: `@` is not in the allowed hostname character class.
+ * A URL is fetchable only if it is HTTPS, on the allowlist, and on the default port. Parsed
+ * with a regex rather than `URL` so this module needs no host globals at all — and so a
+ * scheme-relative or userinfo-bearing URL (`https://github.com@evil.test/x`) cannot smuggle a
+ * host past us: `@` is not in the allowed hostname character class.
+ *
+ * No port is accepted, not even an explicit `:443`. GitHub does not serve release assets on
+ * anything else, so `https://github.com:1337/...` is not a URL we could ever legitimately be
+ * redirected to — and every extra shape the allowlist accepts is one more thing to reason
+ * about when the question is "can this download point somewhere we did not intend".
  */
 export function isAllowedDownloadUrl(url) {
-	const m = /^https:\/\/([A-Za-z0-9.-]+)(?::\d+)?(\/|$)/.exec(String(url ?? ""));
+	const m = /^https:\/\/([A-Za-z0-9.-]+)(\/|$)/.exec(String(url ?? ""));
 	if (!m) return false;
 	return ALLOWED_DOWNLOAD_HOSTS.includes(m[1].toLowerCase());
 }
