@@ -39,9 +39,15 @@ export default class StandingQuestionsPlugin extends Plugin {
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
-		await this.refreshLicense();
 
+		// Build everything saveSettings() touches BEFORE refreshLicense(), which persists — and so
+		// calls saveSettings() — whenever the stored entitlement transitions at load (a revoked or
+		// no-longer-verifying Pro key). Constructing the index after that point would brick onload()
+		// on exactly the downgrade path revocation exists for, leaving no free tier and no settings
+		// tab to paste a replacement key.
 		this.index = new QuestionIndex(this.app, this.settings);
+
+		await this.refreshLicense();
 
 		// Constructing a host SPAWNS NOTHING and DOWNLOADS NOTHING — the child starts lazily on the
 		// first request, and a download happens only from EngineInstallModal's confirm handler. This
@@ -152,7 +158,7 @@ export default class StandingQuestionsPlugin extends Plugin {
 		this.clearTimer(this.saveTimer);
 		this.saveTimer = null;
 		await this.saveData(this.settings);
-		this.index.updateSettings(this.settings);
+		this.index?.updateSettings(this.settings);
 		// ALWAYS with our plugin id. The host is SHARED, and it keeps one bucket of engine settings
 		// per add-on so that N add-ons cannot fight over a single global `enginePath`. Omitting the
 		// id lands our path in the anonymous bucket, which (a) sorts first and so silently outranks
