@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # Bare semver, no `v` prefix — Obsidian requires the tag to equal manifest.version.
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install and build
+        run: |
+          npm ci
+          npm run build
+          npm test
+
+      - name: Verify release files
+        run: |
+          test -f main.js
+          test -f manifest.json
+          test -f styles.css
+          test -f versions.json
+          node -e "const m=require('./manifest.json'); const t='${GITHUB_REF#refs/tags/}'; if(m.version!==t){console.error('manifest',m.version,'!= tag',t); process.exit(1)}; const v=require('./versions.json'); if(!v[m.version]){console.error('versions.json missing',m.version); process.exit(1)}"
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          target_commitish: main
+          make_latest: true
+          files: |
+            main.js
+            manifest.json
+            styles.css
+            versions.json
+          generate_release_notes: true

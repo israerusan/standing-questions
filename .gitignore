@@ -1,0 +1,18 @@
+node_modules/
+main.js
+*.js.map
+.DS_Store
+test/.build/
+
+# Downloaded engine archives, and any zip a local build leaves behind.
+*.zip
+
+# License signing key — author-only. There is no key in THIS repo (the suite key is
+# minted only in obsidian-plugin-core), and this line exists to make sure one can
+# never be committed here by accident.
+scripts/.license-private.key
+scripts/*.key
+
+# Round-table review transcripts — local tooling artifact, never part of the source.
+.roundtable/
+*.diff

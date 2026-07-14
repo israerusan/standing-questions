@@ -1,0 +1,41 @@
+{
+  "name": "standing-questions",
+  "version": "1.0.0",
+  "description": "Track the open questions in your vault and surface new notes that may answer them.",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit -p . && node esbuild.config.mjs production",
+    "typecheck": "tsc --noEmit -p .",
+    "lint": "tsc --noEmit -p . && eslint . --max-warnings 0",
+    "sync:shared": "node scripts/sync-shared.mjs",
+    "test": "npm run lint && node scripts/sync-shared.mjs --check && node test/run.mjs",
+    "test:ci": "node test/run.mjs",
+    "install:vault": "npm run build && node scripts/install-vault.mjs"
+  },
+  "keywords": [
+    "obsidian",
+    "questions",
+    "research",
+    "knowledge",
+    "second-read"
+  ],
+  "author": "Israel Avila",
+  "license": "MIT",
+  "devDependencies": {
+    "@codemirror/state": "^6.5.0",
+    "@codemirror/view": "^6.26.0",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
+    "eslint": "^9.39.4",
+    "eslint-plugin-obsidianmd": "^0.4.1",
+    "obsidian": "1.7.2",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.62.1"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "tweetnacl": "^1.0.3"
+  }
+}

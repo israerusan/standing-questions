@@ -1,0 +1,8 @@
+# Normalize every text file to LF in the repository and on checkout, so line
+# endings are deterministic regardless of a contributor's core.autocrlf setting.
+# Without this, a Windows clone (core.autocrlf=true) can stage CRLF-normalized
+# blobs and produce a whole-file "phantom diff" that buries real review.
+* text=auto eol=lf
+
+# The bundled distribution artifact is JS text; keep it LF too.
+main.js text eol=lf

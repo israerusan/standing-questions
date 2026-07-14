@@ -1,0 +1,29 @@
+name: CI
+
+# The full gate — typecheck, the review bot's own lint ruleset, the Node test suite, and
+# a production build — on every push to main and every pull request, so a regression is
+# caught BEFORE a release tag, not when one is pushed.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install, build, test
+        run: |
+          npm ci
+          npm run build
+          npm test
