@@ -331,6 +331,21 @@ export class EngineHost {
 		this.resolveSettings();
 	}
 
+	/**
+	 * Every still-contributing plugin's settings, copied out.
+	 *
+	 * EngineBroker needs this to seed a REPLACEMENT host when it has to discard a disposed one:
+	 * the surviving plugins are still loaded, still have their BYO "Path to an existing engine"
+	 * configured, and will never re-send it — they do not know the host was swapped. Without
+	 * this the replacement is built from the acquiring plugin's settings alone and every sibling
+	 * silently reverts to downloading the engine.
+	 */
+	pluginSettings(): Map<string, EngineSettings> {
+		const copy = new Map<string, EngineSettings>();
+		for (const [pluginId, settings] of this.settingsByPlugin) copy.set(pluginId, { ...settings });
+		return copy;
+	}
+
 	/** First non-empty `enginePath`, by plugin id. The anonymous bucket ("") sorts first. */
 	private resolveSettings(): void {
 		let enginePath: string | undefined;

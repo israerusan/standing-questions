@@ -106,6 +106,22 @@ export class EngineBroker {
 		}
 
 		const host = new EngineHost(app, settings, pluginId);
+
+		// ...and carry their SETTINGS across too. Building the replacement from only the
+		// acquiring plugin's settings silently drops every sibling's configured "Path to an
+		// existing engine" — and nothing ever puts it back, because those plugins are already
+		// loaded and have no idea the host was swapped. They would revert to DOWNLOADING the
+		// engine, on precisely the Defender / noexec / Flatpak / Gatekeeper machines where BYO
+		// is the documented fallback because the download is the thing that does not work.
+		// `release()` already calls forgetPlugin(), so anything still in this map belongs to a
+		// plugin that is still loaded (or to the anonymous "" bucket, which is shared).
+		if (existing) {
+			for (const [id, prior] of existing.host.pluginSettings()) {
+				if (id === pluginId) continue; // ours is the fresher one, and it is already in
+				host.updateSettings(prior, id);
+			}
+		}
+
 		if (!host.desktop) {
 			// Mobile / no window.require. Publish nothing — there is no process to share and
 			// no global to clean up. Every caller degrades to the free tier.

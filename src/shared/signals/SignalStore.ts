@@ -51,14 +51,50 @@ export const SIGNALS_DIR = "second-read/signals";
 /** Events buffer in memory and hit the disk at most this often. Never one append per keystroke. */
 export const SIGNALS_FLUSH_MS = 10_000;
 /**
+ * THE COMPACTION HORIZON, and the reason it exists.
+ *
+ * Compaction folds events into a snapshot and then drops them from the log. Both steps are
+ * only safe for an event that is FINISHED ARRIVING — every event that precedes it must already
+ * be on disk, or the fold sees a partial history and the truncate makes that permanent.
+ *
+ * The other plugin's store buffers its events in memory for up to `flushMs` before it appends
+ * them, and it lives in ANOTHER PLUGIN'S BUNDLE: the compactor cannot reach it, cannot flush
+ * it, and cannot even see it. So at any instant, an event that happened up to `flushMs` ago may
+ * still be nowhere on disk. Consume events up to "now" and this happens:
+ *
+ *   Effort Index buffers `dwell b.md`.  Note Decay records `rename b.md -> c.md`, flushes, and
+ *   compacts. The rename folds against an index in which `b.md` DOES NOT EXIST YET, matches
+ *   nothing, and is then truncated off disk forever. Ten seconds later the dwell lands and
+ *   folds onto `b.md` — a path the user no longer has. `b.md`'s history can never reach `c.md`,
+ *   and the next `compact(livePaths)` deletes it outright. The same shape RESURRECTS A DELETED
+ *   NOTE (the delete folds against an index without the note; the note's `edit` lands after).
+ *
+ * The fix is a cutoff below which NO shard can still produce an event. An event stamped `t` is
+ * appended by `t + flushMs` at the latest, so anything older than `now - 2*flushMs` is
+ * guaranteed to be on disk already, and events are folded in timestamp order. A compaction
+ * consumes only events at or below that horizon and RETAINS the rest of the log verbatim.
+ *
+ * This costs nothing: `readIndex()` still folds the whole log, so a reader always sees the
+ * newest events. Only the snapshot lags.
+ */
+export const SIGNALS_COMPACT_LAG_MS = 2 * SIGNALS_FLUSH_MS;
+/**
  * 2 — a snapshot now holds the fold of EVERY shard, plus a per-shard watermark, instead of
  * only its own shard's events. A v1 snapshot is discarded on read (the logs are still
  * authoritative). See `compact()` for why the old shape produced permanent ghost aggregates.
+ *
+ * The horizon did NOT need a version bump: a v2 snapshot written by a store that consumed up to
+ * "now" and one written by a store that consumed up to the horizon differ only in how far their
+ * watermarks reach, and a reader replays every log event above the watermark either way.
  */
 export const SNAPSHOT_VERSION = 2;
 
 export interface SignalStoreOptions {
 	flushMs?: number;
+	/** How far behind "now" a compaction stops consuming. Defaults to `2 * flushMs`; it must be
+	 *  at least the largest `flushMs` of ANY store writing this vault. See
+	 *  SIGNALS_COMPACT_LAG_MS — this is not a tuning knob, it is a correctness bound. */
+	compactLagMs?: number;
 	maxLines?: number;
 	revisionGapMs?: number;
 	minSessionMs?: number;
@@ -127,8 +163,12 @@ export class SignalStore {
 		this.app = app;
 		this.pluginId = pluginId;
 		this.writerId = writerId;
+		const flushMs = opts.flushMs ?? SIGNALS_FLUSH_MS;
 		this.opts = {
-			flushMs: opts.flushMs ?? SIGNALS_FLUSH_MS,
+			flushMs,
+			// Derived from OUR flushMs, which is the same constant every Second Read plugin
+			// vendors — see SIGNALS_COMPACT_LAG_MS for why it cannot be smaller.
+			compactLagMs: opts.compactLagMs ?? 2 * flushMs,
 			maxLines: opts.maxLines ?? SIGNALS_MAX_LINES,
 			revisionGapMs: opts.revisionGapMs ?? DEFAULT_REVISION_GAP_MS,
 			minSessionMs: opts.minSessionMs ?? DEFAULT_MIN_SESSION_MS,
@@ -237,7 +277,12 @@ export class SignalStore {
 	 * "somebody else's event" to somebody.
 	 */
 	async readIndex(): Promise<SignalsIndex> {
-		const { snapshot, events } = await this.gather();
+		const { snapshot, byShard } = await this.gather();
+		const events: SignalEvent[] = [];
+		// The WHOLE un-consumed tail, horizon or no horizon. The horizon governs what a snapshot
+		// may swallow, never what a reader may see: an event three seconds old is still the
+		// truth, it is just not yet safe to fold it into a snapshot and delete it.
+		for (const shardEvents of byShard.values()) events.push(...shardEvents);
 		for (const event of this.buffer) events.push(event);
 		return foldSignals(events, snapshot.index, this.foldOptions());
 	}
@@ -257,6 +302,13 @@ export class SignalStore {
 	 * reap. A single complete index plus a PER-SHARD watermark fixes that: an event is
 	 * consumed exactly once (by whichever snapshot folded it), every shard's log is still
 	 * truncated only by its own owner, and a delete applies to the whole vault.
+	 *
+	 * WHAT IT MAY CONSUME. Only events at or below the HORIZON (`now - compactLagMs`). A shard
+	 * that lives in another plugin's bundle buffers its events in memory for up to `flushMs`,
+	 * and this code cannot flush it, so anything newer than the horizon may still have an older
+	 * event queued behind it. Folding it anyway is what turned a cross-shard rename into
+	 * permanent data loss. Everything above the horizon is written back to the log verbatim.
+	 * See SIGNALS_COMPACT_LAG_MS.
 	 *
 	 * ORDER MATTERS: snapshot FIRST, truncate SECOND. A crash between the two leaves both the
 	 * snapshot and the full log on disk — which would double-count every event, except that
@@ -342,8 +394,12 @@ export class SignalStore {
 		this.lines += events.length;
 	}
 
-	/** The freshest snapshot, plus every shard's log events that it has NOT already consumed. */
-	private async gather(): Promise<{ snapshot: LoadedSnapshot; events: SignalEvent[] }> {
+	/**
+	 * The freshest snapshot, plus each shard's log events that it has NOT already consumed,
+	 * KEYED BY SHARD. The caller decides what to do with them: `readIndex()` folds all of them,
+	 * `doCompact()` folds only the ones below the horizon and puts ours back on disk.
+	 */
+	private async gather(): Promise<{ snapshot: LoadedSnapshot; byShard: Map<string, SignalEvent[]> }> {
 		const shards = await this.listShards();
 
 		let snapshot = EMPTY_SNAPSHOT;
@@ -354,19 +410,16 @@ export class SignalStore {
 			if (candidate.generatedAt >= snapshot.generatedAt) snapshot = candidate;
 		}
 
-		const events: SignalEvent[] = [];
-		const newest: Record<string, number> = Object.create(null);
+		const byShard = new Map<string, SignalEvent[]>();
 		for (const shard of shards) {
 			const parsed = parseSignalLog(await this.readIfExists(normalizePath(`${this.dir}/${shard}.ndjson`)));
 			const watermark = snapshot.consumed[shard] ?? 0;
-			let high = watermark;
-			for (const event of parsed.events) {
-				if (event.t > watermark) events.push(event);
-				if (event.t > high) high = event.t;
-			}
-			newest[shard] = high;
+			byShard.set(
+				shard,
+				parsed.events.filter((event) => event.t > watermark)
+			);
 		}
-		return { snapshot: { ...snapshot, consumed: { ...snapshot.consumed, ...newest } }, events };
+		return { snapshot, byShard };
 	}
 
 	private async doCompact(livePaths: Set<string> | null, now: number): Promise<void> {
@@ -374,28 +427,65 @@ export class SignalStore {
 		const adapter = this.app.vault.adapter;
 
 		// Land the buffer before we fold. Otherwise a buffered event would be appended AFTER
-		// the watermark that already covers its timestamp, and the reader would skip it.
+		// the watermark that already covers its timestamp, and the reader would skip it. This
+		// only reaches OUR buffer — the other plugin's store is in another bundle, which is the
+		// whole reason the horizon below has to exist.
 		const pending = this.buffer;
 		this.buffer = [];
 		await this.appendLines(pending);
 
-		const { snapshot, events } = await this.gather();
-		let index = foldSignals(events, snapshot.index, this.foldOptions());
-		index = pruneSignals(index, livePaths, now, this.opts.retentionMs);
+		const { snapshot, byShard } = await this.gather();
+
+		// THE HORIZON. Nothing newer than this may be folded or truncated — another shard could
+		// still be holding an event that BELONGS BEFORE IT. See SIGNALS_COMPACT_LAG_MS.
+		const horizon = now - this.opts.compactLagMs;
+
+		const consumable: SignalEvent[] = [];
+		/** Our own log lines above the horizon. They go straight back onto disk. */
+		const retained: SignalEvent[] = [];
+		/** Paths an un-consumed event still refers to, from ANY shard. */
+		const unsettled = new Set<string>();
+		const consumed: Record<string, number> = { ...snapshot.consumed };
+
+		for (const [shard, shardEvents] of byShard) {
+			let watermark = snapshot.consumed[shard] ?? 0;
+			for (const event of shardEvents) {
+				if (event.t <= horizon) {
+					consumable.push(event);
+					if (event.t > watermark) watermark = event.t;
+					continue;
+				}
+				// Above the horizon: it stays on disk and its shard's watermark stays below it, so
+				// the next compaction that can see the whole picture folds it then. Its owner
+				// rewrites its own log; we only rewrite ours.
+				if (shard === this.writerId) retained.push(event);
+				unsettled.add(event.p);
+				if (event.k === "rename") unsettled.add(event.from);
+			}
+			consumed[shard] = watermark;
+		}
+
+		let index = foldSignals(consumable, snapshot.index, this.foldOptions());
+		// A path that an un-consumed event still names is NOT prunable, even though the vault no
+		// longer has a file there: the `rename` that will carry its history to the new path has
+		// not been folded yet, and pruning by `livePaths` would delete the source out from under
+		// it — losing exactly the history the rename exists to preserve.
+		index = pruneSignals(index, keepAlso(livePaths, unsettled), now, this.opts.retentionMs);
 
 		const payload: SignalsSnapshot = {
 			version: SNAPSHOT_VERSION,
 			writerId: this.writerId,
 			generatedAt: now,
-			consumed: snapshot.consumed,
+			consumed,
 			index,
 		};
 		await adapter.write(this.snapshotPath, JSON.stringify(payload));
-		// Only OUR shard. Another plugin owns its log file and may be appending to it right
-		// now; its events are already in the snapshot above and its watermark says so, so it
-		// will truncate them itself on its own next compaction.
-		await adapter.write(this.logPath, "");
-		this.lines = 0;
+		// Only OUR shard, and only the part of it the snapshot above actually CONSUMED. Blanking
+		// the file threw away every event still above the horizon — including, in the worst case,
+		// the only copy of a cross-shard rename or delete. Another plugin owns its own log file
+		// and truncates it itself, on its own next compaction, against its own watermark.
+		await adapter.write(this.logPath, retained.map(serializeEvent).join(""));
+		this.lines = retained.length;
 	}
 
 	private async readIfExists(path: string): Promise<string> {
@@ -453,6 +543,15 @@ export class SignalStore {
 		}
 		return [...shards].sort();
 	}
+}
+
+/** `livePaths`, widened by the paths a not-yet-folded event still depends on. `null` in (keep
+ *  everything) stays `null` out — a caller that cannot enumerate the vault prunes nothing. */
+function keepAlso(livePaths: Set<string> | null, extra: Set<string>): Set<string> | null {
+	if (!livePaths || extra.size === 0) return livePaths;
+	const union = new Set(livePaths);
+	for (const path of extra) union.add(path);
+	return union;
 }
 
 function countLines(text: string): number {

@@ -1,26 +1,32 @@
-import { verifyLicense, type LicenseVerification } from "../shared/verifyLicense.mjs";
-import { SUITE_LICENSE_PUBLIC_KEY, SUITE_PRODUCT_ID } from "../shared/suiteLicense.mjs";
-import { isRevoked } from "../shared/revokedLicenses.mjs";
+import { verifySuiteLicense } from "../shared/suiteLicense.mjs";
 
 export type { LicensePayload, LicenseVerification } from "../shared/verifyLicense.mjs";
+export type { SuiteLicenseDeps } from "../shared/suiteLicense.mjs";
+export { verifySuiteLicense } from "../shared/suiteLicense.mjs";
 
 /**
- * Thin binding over the shared verifier. One Second Read key unlocks Pro in all five
- * add-ons, so the product id and the public key both come from the vendored shared module
- * — never from this plugin's own product.ts identity. That is what makes "one key, five
- * plugins" structurally impossible to get wrong: there is no per-plugin keyspace to drift
- * into, and no private key anywhere in this repo to leak.
+ * The plugin's license entry point: a THIN RE-EXPORT of the shared suite verifier.
  *
- * Revocation is checked BEFORE the signature. A key that has leaked publicly still carries
- * a VALID signature — the only way to kill it without rotating the suite keypair (which
- * would revoke Pro for every paying customer at once) is to reject it by value.
+ * `verify` is BOUND to `verifySuiteLicense` — it is not a method that reimplements it. That
+ * is deliberate and load-bearing: `LicenseManager.verify === verifySuiteLicense` is asserted
+ * in test/license-revocation.test.ts, which leaves no room for this file to re-grow its own
+ * copy of the composition.
+ *
+ * WHY. The revocation-then-signature composition used to be hand-copied into all five
+ * `src/license/LicenseManager.ts` files, which nothing — no test, no linter, no drift check —
+ * ever compared against each other. With ONE suite keypair, the by-value denylist is the only
+ * revocation mechanism there is (rotating the keypair would revoke Pro for every paying
+ * customer at once, because a leaked key's signature is perfectly VALID). So one plugin
+ * quietly losing its `isRevoked` call means a revoked, leaked key keeps unlocking Pro there,
+ * silently, forever. The composition now lives in exactly one file, vendored byte-identically
+ * by `npm run sync:shared` and guarded by src/shared/MANIFEST.sha256.
+ *
+ * The product id and the public key both come from the vendored shared module — never from
+ * this plugin's own manifest identity — which is what makes "one key, five plugins"
+ * structurally impossible to get wrong. Verification is entirely offline, and there is no
+ * private key anywhere in this repo to leak.
  */
 export class LicenseManager {
-	static verify(licenseKey: string): LicenseVerification {
-		const key = String(licenseKey ?? "").trim();
-		if (isRevoked(key)) {
-			return { valid: false, error: "This key has been revoked. Contact support for a replacement." };
-		}
-		return verifyLicense(key, SUITE_PRODUCT_ID, SUITE_LICENSE_PUBLIC_KEY);
-	}
+	/** THE decision on whether a key unlocks Pro. The shared function itself, by reference. */
+	static readonly verify: typeof verifySuiteLicense = verifySuiteLicense;
 }
