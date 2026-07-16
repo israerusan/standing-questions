@@ -21,8 +21,16 @@ export const ENGINE_RELEASE_BASE = "https://github.com/israerusan/second-read-en
 /** Engine tags are `sidecar-v<version>` — distinct from plugin tags, which are bare X.Y.Z (DESIGN 7.4). */
 export const ENGINE_TAG_PREFIX = "sidecar-v";
 
-/** The only (platform, arch) pairs the sidecar CI builds. Everything else is BYO-path or nothing. */
-export const SUPPORTED_TARGETS = Object.freeze(["win-x64", "macos-arm64", "macos-x64", "linux-x64"]);
+/**
+ * The (platform, arch) pairs the sidecar CI builds AND publishes a checksum for. macos-x64
+ * (Intel Mac) is deliberately absent as of engine 0.1.0: it can only build on GitHub's
+ * retiring macos-13 runner, which now queues for hours or never starts, so shipping it
+ * blocked the whole release on a platform Apple has not sold since ~2023. `resolveTarget`
+ * still MAPS darwin/x64 to "macos-x64" so an Intel Mac gets the specific "no build for your
+ * platform, set a BYO path or use free features" message (via installPlan's refusal), rather
+ * than a silent generic null. Re-add it here when a later engine release ships that binary.
+ */
+export const SUPPORTED_TARGETS = Object.freeze(["win-x64", "macos-arm64", "linux-x64"]);
 
 /**
  * Hosts a download redirect may land on. GitHub 302s a release asset to its object
