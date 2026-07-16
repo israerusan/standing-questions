@@ -150,19 +150,20 @@ export interface RequestOptions {
 
 /* ------------------------------------------------------ Node, lazily typed -- */
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
-type NodeRequire = (id: string) => any;
+// `window.require` hands back `unknown`; loadNode() narrows each module to its real
+// type-only shape below. Nothing here is a static `import "fs"` — the requires are lazy
+// and desktop-guarded — so `isDesktopOnly: false` and the mobile free tier are unaffected.
+type NodeRequire = (id: string) => unknown;
 
 interface NodeApi {
-	cp: any;
-	fs: any;
-	https: any;
-	os: any;
-	path: any;
-	crypto: any;
-	proc: any;
+	cp: typeof import("child_process");
+	fs: typeof import("fs");
+	https: typeof import("https");
+	os: typeof import("os");
+	path: typeof import("path");
+	crypto: typeof import("crypto");
+	proc: typeof import("process");
 }
-/* eslint-enable @typescript-eslint/no-explicit-any */
 
 /** ~45 MB over a bad hotel connection is still under this. */
 const DOWNLOAD_STALL_MS = 60_000;
@@ -194,13 +195,13 @@ function loadNode(): NodeApi | null {
 		const req = (window as unknown as { require?: NodeRequire }).require;
 		if (typeof req !== "function") return null;
 		return {
-			cp: req("child_process"),
-			fs: req("fs"),
-			https: req("https"),
-			os: req("os"),
-			path: req("path"),
-			crypto: req("crypto"),
-			proc: req("process"),
+			cp: req("child_process") as typeof import("child_process"),
+			fs: req("fs") as typeof import("fs"),
+			https: req("https") as typeof import("https"),
+			os: req("os") as typeof import("os"),
+			path: req("path") as typeof import("path"),
+			crypto: req("crypto") as typeof import("crypto"),
+			proc: req("process") as typeof import("process"),
 		};
 	} catch {
 		return null;
@@ -286,7 +287,7 @@ export class EngineHost {
 	private settings: EngineSettings;
 	private readonly node: NodeApi | null;
 
-	private child: { pid?: number; stdin: any; stdout: any; stderr: any; kill: (s?: string) => void } | null = null; // eslint-disable-line @typescript-eslint/no-explicit-any
+	private child: import("child_process").ChildProcessWithoutNullStreams | null = null;
 	/** The exe we spawned, kept so a kill can verify it is still killing OUR process. */
 	private childExePath: string | null = null;
 	private decoder = new FrameDecoder();
@@ -736,9 +737,9 @@ export class EngineHost {
 		this.startSweep();
 
 		try {
-			const health = (await this.request("health", undefined, {
+			const health = await this.request<EngineHealth>("health", undefined, {
 				timeoutMs: HEALTH_TIMEOUT_MS,
-			})) as EngineHealth;
+			});
 			this.lastHealth = health;
 			this.state = "running";
 			return health;
@@ -988,7 +989,11 @@ export class EngineHost {
 		const pidFile = this.pidFile(node);
 		let record: { pid?: number; exePath?: string; parentPid?: number } | null = null;
 		try {
-			record = JSON.parse(await node.fs.promises.readFile(pidFile, "utf8"));
+			record = JSON.parse(await node.fs.promises.readFile(pidFile, "utf8")) as {
+				pid?: number;
+				exePath?: string;
+				parentPid?: number;
+			};
 		} catch {
 			return;
 		}
@@ -1118,8 +1123,7 @@ export class EngineHost {
 		return new Promise<string>((resolve, reject) => {
 			let hops = 0;
 			let settled = false;
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			let out: any = null;
+			let out: import("fs").WriteStream | null = null;
 			const fail = (err: unknown) => {
 				if (settled) return;
 				settled = true;
@@ -1146,7 +1150,7 @@ export class EngineHost {
 				const req = https.get(
 					current,
 					{ headers: { "user-agent": "second-read-engine-installer", accept: "application/octet-stream" } },
-					(res: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
+					(res) => {
 						const status: number = res.statusCode ?? 0;
 						const location: string | undefined = res.headers?.location;
 
