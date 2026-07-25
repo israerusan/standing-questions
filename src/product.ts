@@ -29,7 +29,7 @@ export const PRO_PRICE_LABEL = "$29 one-time";
  * move to a processor that can sign and email the key before launch. Until then the
  * checkout page must say "your key is emailed within 24 hours" — do not ship silence.
  */
-export const PURCHASE_URL = "https://buymeacoffee.com/vaultspotlight";
+export const PURCHASE_URL = "https://buymeacoffee.com/vaultspotlight/e/560213";
 
 export const PRO_TAGLINE =
 	"One key unlocks Pro in all five Second Read add-ons: Note Decay, Standing Questions, Effort Index, Prior Art, and Unwritten. $29 one-time, no subscription, no account.";

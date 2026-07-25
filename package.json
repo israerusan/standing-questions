@@ -1,6 +1,6 @@
 {
   "name": "standing-questions",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "Track the open questions in your vault and surface new notes that may answer them.",
   "main": "main.js",
   "type": "module",
