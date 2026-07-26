@@ -6,6 +6,11 @@ Every vault has open questions in it. *Why did we drop the CRDT plan? How long s
 
 Standing Questions makes a question a first-class object: it has a state, it has sub-questions, and it watches for its own answer.
 
+<!-- SCREENSHOT SLOT — drop a real Obsidian capture here to lift conversions.
+     ![The question board (open / partial / answered) and a "this may answer a question you asked in January" lead notice](docs/assets/hero.png)
+     Suggested shot: the question board with a few open/answered questions, plus the lead notice popping on a saved note. Save as docs/assets/hero.png -->
+
+
 > Standing Questions never edits your notes without being asked. Leads are **notify-only** by default: it tells you, and you click. The only thing it ever writes on its own is a `status:` line in a question's frontmatter, when its sub-questions are all answered — and that is a toggle you can turn off.
 
 ## How it works
@@ -70,6 +75,8 @@ Nothing is written until you press it. (There is an opt-in setting that appends 
 ### Pro — $29 one-time, unlocks all five Second Read add-ons
 
 - **Semantic lead detection.** The note that answers *"Why did we drop the CRDT plan?"* without ever using the word CRDT. Your note is compared against every open question **by meaning**, not by keyword.
+
+> **Second Read Pro — $29 one-time.** One key unlocks Pro in all five Second Read add-ons (Note Decay, Standing Questions, Effort Index, Prior Art, Unwritten). Buy here: https://buymeacoffee.com/vaultspotlight/e/560213 — the key is emailed to you **automatically, within seconds** (delivery is fully automated); paste it into Settings → Standing Questions → License. It is verified **offline** (Ed25519) — no account, no server, no subscription.
 
 Pro needs the local semantic engine (below). One key unlocks Pro in all five Second Read add-ons: Note Decay, Standing Questions, Effort Index, Prior Art, and Unwritten. Licenses are verified **offline** with an Ed25519 signature built into the add-on. No account, no server, no network request.
 
