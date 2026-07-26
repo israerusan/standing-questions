@@ -127,7 +127,9 @@ No default hotkeys — bind your own in Settings → Hotkeys.
 
 ## Install
 
-Not yet in the community directory. To install manually, copy `main.js`, `manifest.json`, and `styles.css` into `<vault>/.obsidian/plugins/standing-questions/` and enable it in Settings → Community plugins.
+**Community plugins (recommended):** open **Settings → Community plugins**, search **Standing Questions**, and install it — one click, auto-updates.
+
+**Manual install:** copy `main.js`, `manifest.json`, and `styles.css` into `<vault>/.obsidian/plugins/standing-questions/` and enable it in Settings → Community plugins.
 
 ## Development
 
