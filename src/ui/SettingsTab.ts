@@ -47,6 +47,7 @@ export class StandingQuestionsSettingTab extends PluginSettingTab {
 		this.renderLeads();
 		this.renderPro();
 		this.renderEngine();
+		this.renderFeedback();
 
 		// The engine's state is on disk, so reading it is async and display() is not. Ask once,
 		// then re-render — never in a loop.
@@ -653,6 +654,26 @@ export class StandingQuestionsSettingTab extends PluginSettingTab {
 			this.installing = false;
 			this.display();
 		}
+	}
+
+	// --- Feedback ----------------------------------------------------------------
+
+	private renderFeedback(): void {
+		new Setting(this.containerEl).setName("Feedback").setHeading();
+
+		new Setting(this.containerEl)
+			.setName("Bugs and feature requests")
+			.setDesc("Issues and ideas are tracked on GitHub. Opens in your browser.")
+			.addButton((button) =>
+				button.setButtonText("Report a bug").onClick(() => {
+					window.open("https://github.com/israerusan/standing-questions/issues/new?labels=bug");
+				})
+			)
+			.addButton((button) =>
+				button.setButtonText("Request a feature").onClick(() => {
+					window.open("https://github.com/israerusan/standing-questions/issues/new?labels=enhancement");
+				})
+			);
 	}
 }
 
