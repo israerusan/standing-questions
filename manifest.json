@@ -3,7 +3,7 @@
   "name": "Standing Questions",
   "version": "0.9.2",
   "minAppVersion": "1.5.0",
-  "description": "Track the open questions in your vault and surface new notes that may answer them.",
+  "description": "Keep your open questions in view and get told when a new note looks like it answers one, instead of rediscovering them months later.",
   "author": "Israel Avila",
   "authorUrl": "https://github.com/israerusan",
   "fundingUrl": "https://buymeacoffee.com/vaultspotlight/e/560213",

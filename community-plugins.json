@@ -3,7 +3,7 @@
     "id": "standing-questions",
     "name": "Standing Questions",
     "author": "Israel Avila",
-    "description": "Track the open questions in your vault and surface new notes that may answer them.",
+    "description": "Keep your open questions in view and get told when a new note looks like it answers one, instead of rediscovering them months later.",
     "repo": "israerusan/standing-questions"
   }
 ]
